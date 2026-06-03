@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+numpy
+scipy
+pandas
+psutil
+openpyxl
+reportlab
+matplotlib
+Pillow
+websockets
+gpiozero
+RPi.GPIO
+adafruit-circuitpython-ads1x15
+adafruit-blinka

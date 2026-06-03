@@ -1,0 +1,5 @@
+/* CSS extra de componentes (opcional). 
+   No pongas @tailwind aquí. */
+
+/* FIX: evitar SVG gigantes por reglas globales */
+svg{max-width:100%;height:auto}
