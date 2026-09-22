@@ -37,6 +37,10 @@ RR_MAX_S = 2.000
 RMSSD_WARN_MS = 250.0
 BPM_RPEAK_TOLERANCE_FRAC = 0.25
 BPM_RPEAK_TOLERANCE_MIN = 3
+MAD_K = float(os.getenv("ECG_MAD_K", "8.0"))
+MAD_INTEGRATION_S = float(os.getenv("ECG_MAD_INTEGRATION_S", "0.150"))
+MAD_REFRACTORY_S = float(os.getenv("ECG_MAD_REFRACTORY_S", "0.250"))
+MAD_LOCALIZATION_S = float(os.getenv("ECG_MAD_LOCALIZATION_S", "0.150"))
 
 
 def get_interpreter():
@@ -86,11 +90,104 @@ def _bandpass_notch(v: np.ndarray, fs: float) -> np.ndarray:
     return signal.filtfilt(b_band, a_band, v1)
 
 
-def _detect_r_peaks(v_clean: np.ndarray, fs: float) -> np.ndarray:
-    # Simple detector: adaptive threshold + refractory period
-    thr = float(np.mean(v_clean) + np.std(v_clean) * 2.0)
-    peaks, _ = signal.find_peaks(v_clean, height=thr, distance=int(fs * 0.5))
-    return peaks.astype(int)
+def _moving_average_same(x: np.ndarray, window: int) -> np.ndarray:
+    if len(x) < 3 or window <= 1:
+        return x.astype(float, copy=True)
+    if window % 2 == 0:
+        window += 1
+    window = min(window, len(x) if len(x) % 2 else len(x) - 1)
+    kernel = np.ones(window, dtype=float) / float(window)
+    pad = window // 2
+    return np.convolve(np.pad(x, (pad, pad), mode="edge"), kernel, mode="valid")
+
+
+def mad_filter_ecg(v: np.ndarray, fs: float) -> np.ndarray:
+    """Filter used by the deployed MAD detector in every backend output path."""
+    v = np.asarray(v, dtype=float)
+    nyquist = fs / 2.0
+    highcut = min(40.0, nyquist * 0.80)
+    if v.size < max(5, int(fs * 2)) or highcut <= 0.6:
+        return v - np.mean(v) if v.size else v.copy()
+    b_band, a_band = signal.butter(2, [0.5, highcut], btype="bandpass", fs=fs)
+    return signal.filtfilt(b_band, a_band, v)
+
+
+def detect_mad_r_peaks(v_clean: np.ndarray, fs: float, k: float = MAD_K) -> np.ndarray:
+    """Detect R peaks using derivative energy and median + k*MAD thresholding.
+
+    Input must already be filtered with :func:`mad_filter_ecg`.
+    """
+    v_clean = np.asarray(v_clean, dtype=float)
+    if v_clean.size < max(5, int(fs * 2)):
+        return np.array([], dtype=int)
+    energy = np.diff(v_clean, prepend=v_clean[0]) ** 2
+    integrated = _moving_average_same(energy, max(1, int(round(MAD_INTEGRATION_S * fs))))
+    median = float(np.median(integrated))
+    mad = float(np.median(np.abs(integrated - median)))
+    threshold = median + float(k) * max(mad, np.finfo(float).eps)
+    candidates, _ = signal.find_peaks(
+        integrated,
+        height=threshold,
+        distance=max(1, int(MAD_REFRACTORY_S * fs)),
+    )
+
+    search = max(1, int(MAD_LOCALIZATION_S * fs))
+    localized = []
+    for candidate in candidates:
+        lo = max(0, int(candidate) - search)
+        hi = min(len(v_clean), int(candidate) + search + 1)
+        localized.append(lo + int(np.argmax(np.abs(v_clean[lo:hi]))))
+
+    refractory = max(1, int(MAD_REFRACTORY_S * fs))
+    accepted: list[int] = []
+    for peak in sorted(set(localized)):
+        if not accepted or peak - accepted[-1] >= refractory:
+            accepted.append(peak)
+        elif abs(v_clean[peak]) > abs(v_clean[accepted[-1]]):
+            accepted[-1] = peak
+    return np.asarray(accepted, dtype=int)
+
+
+def windowed_mad_pipeline(v_mv: np.ndarray, fs: float, window_s: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Filter + detect over non-overlapping `window_s` tiles.
+
+    The live metrics and monitor paths never see more than the last `window_s` seconds:
+    they filter and detect on a rolling buffer, recomputed from scratch every update tick.
+    This reconstructs the same unit of processing for an already-recorded (exported)
+    session, instead of running mad_filter_ecg/detect_mad_r_peaks once over the whole
+    session with a single global median/MAD threshold (see VERIFICACION_INTEGRACION_MAD.md
+    for the measured effect of that difference on MIT-BIH). Tiling matches
+    mitdb_eval/detectors.py::window_edges/run_windowed, the scheme actually validated.
+
+    Returns (filtered_mv, peak_indices): `filtered_mv` has the same length as `v_mv`
+    (each sample filtered as part of its own window); `peak_indices` are global sample
+    indices into `v_mv`.
+    """
+    v_mv = np.asarray(v_mv, dtype=float)
+    n = v_mv.size
+    min_len = max(5, int(fs * 2))
+    if n < min_len:
+        return v_mv.copy(), np.array([], dtype=int)
+
+    w = max(min_len, int(round(window_s * fs)))
+    edges: list[tuple[int, int, int]] = []
+    pos = 0
+    while pos + w <= n:
+        edges.append((pos, pos + w, pos))
+        pos += w
+    if pos < n:
+        start = max(0, n - w)
+        edges.append((start, n, pos))
+
+    filtered = np.empty(n, dtype=float)
+    peaks: list[int] = []
+    for start, end, keep_from in edges:
+        seg_filtered = mad_filter_ecg(v_mv[start:end], fs)
+        filtered[start:end] = seg_filtered
+        seg_peaks = detect_mad_r_peaks(seg_filtered, fs) + start
+        peaks.extend(int(p) for p in seg_peaks if keep_from <= p < end)
+
+    return filtered, np.asarray(sorted(set(peaks)), dtype=int)
 
 
 def _rr_from_peaks(peaks: np.ndarray, fs: float) -> np.ndarray:
@@ -236,11 +333,11 @@ def process_window(t, v, fs: float = 250.0, thr_norm: float = 0.12) -> Dict[str,
             "v_clean": [],
         }
 
-    # Filter
-    v_clean = _bandpass_notch(v, fs)
+    # Unified MAD pipeline used by metrics, WebSocket markers, and exports.
+    v_clean = mad_filter_ecg(v, fs)
 
     # Peaks/HR/HRV
-    raw_peaks = _detect_r_peaks(v_clean, fs)
+    raw_peaks = detect_mad_r_peaks(v_clean, fs)
     peaks, rr = _valid_peaks_and_rr(raw_peaks, fs)
     hr_median, hr_mean = _hr_from_rr(rr)
 
@@ -299,6 +396,9 @@ def process_window(t, v, fs: float = 250.0, thr_norm: float = 0.12) -> Dict[str,
         "raw_rpeaks": int(len(raw_peaks)),
         "analysis_duration_sec": round(duration_sec, 2),
         "quality": quality,
+        "detector": "mad",
+        "detector_k": MAD_K,
+        "detector_refractory_ms": round(MAD_REFRACTORY_S * 1000.0, 1),
         "note": note,
         "rr_s": rr.tolist(),
         "valid_rr_count": int(rr.size),

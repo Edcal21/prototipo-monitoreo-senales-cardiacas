@@ -42,7 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from adafruit_ads1x15.analog_in import AnalogIn
 
-from postprocess_ecg import process_window
+from postprocess_ecg import MAD_K, detect_mad_r_peaks, mad_filter_ecg, process_window, windowed_mad_pipeline
 from session_store import init_sessions_db, start_session, stop_session, list_sessions
 from patient_store import init_db, upsert_patient, get_patient, list_patients
 
@@ -505,24 +505,15 @@ def prepare_monitor_signal(t: np.ndarray, v: np.ndarray, fs_in: Optional[float])
         pass
 
     try:
-        if fs_target / 2.0 > 60.0:
-            b_notch, a_notch = scipy_signal.iirnotch(60.0, 30.0, fs_target)
-            x = scipy_signal.filtfilt(b_notch, a_notch, x)
-
-        b_band, a_band = scipy_signal.butter(2, [0.7, 35.0], btype="bandpass", fs=fs_target)
-        filtered = scipy_signal.filtfilt(b_band, a_band, x)
+        filtered = mad_filter_ecg(x, fs_target)
     except Exception:
         filtered = filter_ecg_signal(x, fs_target)
 
     filtered = filtered - float(np.median(filtered))
-    p01, p99 = np.percentile(filtered, [1, 99])
-    filtered = np.clip(filtered, p01, p99)
 
     rpeak_times: list[float] = []
     try:
-        threshold = float(np.mean(filtered) + np.std(filtered) * 1.7)
-        min_distance = int(fs_target * 0.45)
-        peaks, _ = scipy_signal.find_peaks(filtered, height=threshold, distance=min_distance)
+        peaks = detect_mad_r_peaks(filtered, fs_target)
         rpeak_times = [float(t_uniform[int(p)]) for p in peaks]
     except Exception:
         rpeak_times = []
@@ -1085,7 +1076,8 @@ def acquisition_worker():
                 t_win = t_arr
                 v_win_raw = v_arr
 
-            v_win = filter_ecg_signal(v_win_raw, fs_est)
+            # process_window owns the unified MAD filtering/detection pipeline.
+            v_win = v_win_raw
 
             if lead_off_confirmed:
                 metrics = {
@@ -1308,7 +1300,9 @@ async def ws_ecg(websocket: WebSocket):
 
             metrics["rpeak_times"] = rpeak_times
             metrics["display_fs"] = 250.0
-            metrics["display_filter"] = "resample_250hz_notch60_butterworth_0.7_35hz"
+            metrics["display_filter"] = "resample_250hz_butterworth2_0.5_40hz_mad_k8"
+            metrics["display_detector"] = "mad"
+            metrics["display_detector_k"] = MAD_K
             metrics["demo_loop"] = use_demo_loop
 
             await websocket.send_json({
@@ -1674,51 +1668,28 @@ def csv_bytes(rows: list[list[Any]]) -> bytes:
     return out.getvalue().encode("utf-8")
 
 
-def _export_plot_signal(signal_values: list[Any], fs: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _export_plot_signal(signal_values: list[Any], fs: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (t, y_mv, y_v, peaks).
+
+    y_mv is filtered and peaks are detected in non-overlapping WINDOW_S (10 s) tiles via
+    windowed_mad_pipeline, matching the metrics and monitor paths instead of running the
+    MAD threshold once over the whole exported session (see VERIFICACION_INTEGRACION_MAD.md).
+    """
     y_v = np.asarray(signal_values, dtype=float)
     if y_v.size < 2:
         raise HTTPException(status_code=404, detail="La sesion no tiene senal suficiente para graficar.")
 
     t = np.arange(y_v.size, dtype=float) / max(fs, 1.0)
-    y_mv = (y_v - float(np.median(y_v))) * 1000.0
+    y_raw_mv = (y_v - float(np.median(y_v))) * 1000.0
 
-    # Para la imagen clinica usamos una escala visual robusta: conserva la morfologia
-    # y evita que artefactos aislados aplasten el QRS en la grafica.
-    p95 = float(np.percentile(np.abs(y_mv), 95))
-    if p95 > 0:
-        y_mv = np.clip(y_mv / p95, -1.5, 1.5)
-
-    if scipy_signal is not None and y_mv.size > int(fs * 2):
+    y_mv, peaks = y_raw_mv, np.array([], dtype=int)
+    if scipy_signal is not None and y_raw_mv.size > int(fs * 2):
         try:
-            highcut = min(35.0, max(5.0, fs * 0.40))
-            b_band, a_band = scipy_signal.butter(2, [0.7, highcut], btype="bandpass", fs=fs)
-            y_mv = scipy_signal.filtfilt(b_band, a_band, y_mv)
+            y_mv, peaks = windowed_mad_pipeline(y_raw_mv, fs, WINDOW_S)
         except Exception:
             pass
 
-    return t, y_mv, y_v
-
-
-def _detect_export_rpeaks(y_mv: np.ndarray, fs: float) -> np.ndarray:
-    if y_mv.size < int(max(fs, 1.0) * 2):
-        return np.array([], dtype=int)
-
-    if scipy_signal is not None:
-        threshold = float(np.mean(y_mv) + 1.8 * np.std(y_mv))
-        distance = max(1, int(0.45 * fs))
-        peaks, _ = scipy_signal.find_peaks(y_mv, height=threshold, distance=distance)
-        return peaks.astype(int)
-
-    threshold = float(np.mean(y_mv) + 1.8 * np.std(y_mv))
-    peaks = []
-    last = -int(0.45 * fs)
-    for idx in range(1, len(y_mv) - 1):
-        if idx - last < int(0.45 * fs):
-            continue
-        if y_mv[idx] > threshold and y_mv[idx] > y_mv[idx - 1] and y_mv[idx] >= y_mv[idx + 1]:
-            peaks.append(idx)
-            last = idx
-    return np.asarray(peaks, dtype=int)
+    return t, y_mv, y_v, peaks
 
 
 def _add_ecg_grid(ax, duration_s: float, y_min: float, y_max: float) -> None:
@@ -1739,12 +1710,11 @@ def _add_ecg_grid(ax, duration_s: float, y_min: float, y_max: float) -> None:
 
 
 def build_clinical_png_bytes(signal_values: list[Any], fs: float, record_id: str, metrics: Dict[str, Any]) -> BytesIO:
-    t, y_mv, _ = _export_plot_signal(signal_values, fs)
+    t, y_mv, _, peaks = _export_plot_signal(signal_values, fs)
     duration = float(t[-1] - t[0]) if t.size > 1 else 0.0
     window_s = min(10.0, max(2.0, duration))
     n_window = max(2, int(window_s * fs))
 
-    peaks = _detect_export_rpeaks(y_mv, fs)
     if peaks.size:
         center = int(peaks[len(peaks) // 2])
         start = max(0, min(center - n_window // 2, len(y_mv) - n_window))
@@ -1787,8 +1757,7 @@ def build_clinical_png_bytes(signal_values: list[Any], fs: float, record_id: str
 
 
 def build_qrs_zoom_png_bytes(signal_values: list[Any], fs: float, record_id: str) -> BytesIO:
-    t, y_mv, _ = _export_plot_signal(signal_values, fs)
-    peaks = _detect_export_rpeaks(y_mv, fs)
+    t, y_mv, _, peaks = _export_plot_signal(signal_values, fs)
     window_s = 3.0
     n_window = max(2, int(window_s * fs))
 
