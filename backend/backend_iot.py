@@ -227,6 +227,7 @@ class SharedState:
         self.current_record_context: Dict[str, Any] = {}
         self.last_good_metrics: Dict[str, Any] = {}
         self.demo_loop: Dict[str, Any] | None = None
+        self.wall_start: float = 0.0  # time.time() taken alongside acquisition_worker's t_start
 
         self.last_metrics: Dict[str, Any] = {
             "record_id": None,
@@ -452,6 +453,31 @@ def _safe_odd_window(target_size: float, signal_len: int) -> int:
         win += 1
     max_win = signal_len if signal_len % 2 == 1 else signal_len - 1
     return max(1, min(win, max_win))
+
+
+DIAG_LOG_PATH = os.getenv("ECG_DIAG_LOG_PATH", "").strip()
+DIAG_LOG_FLUSH_N = int(os.getenv("ECG_DIAG_LOG_FLUSH_N", "500"))
+_diag_buf: list[float] = []
+_diag_file = None
+
+
+def _diag_log_sample(t_mono: float) -> None:
+    """Opt-in raw acquisition-timestamp logger for the effective-Fs/jitter/dropped-sample
+    diagnostic (see pi_diagnostics/RUNBOOK.md). No-op unless ECG_DIAG_LOG_PATH is set, so it
+    has zero effect on production behavior by default. Writes are batched (DIAG_LOG_FLUSH_N
+    samples per flush) to avoid adding per-sample disk I/O to the acquisition loop."""
+    global _diag_file
+    if not DIAG_LOG_PATH:
+        return
+    if _diag_file is None:
+        _diag_file = open(DIAG_LOG_PATH, "a", buffering=1 << 16, encoding="utf-8")
+        if _diag_file.tell() == 0:
+            _diag_file.write("t_monotonic_s\n")
+    _diag_buf.append(t_mono)
+    if len(_diag_buf) >= DIAG_LOG_FLUSH_N:
+        _diag_file.write("\n".join(f"{x:.6f}" for x in _diag_buf) + "\n")
+        _diag_file.flush()
+        _diag_buf.clear()
 
 
 def moving_average_same(x: np.ndarray, window: int) -> np.ndarray:
@@ -992,6 +1018,7 @@ def acquisition_worker():
 
     STATE.running = True
     t_start = time.perf_counter()
+    STATE.wall_start = time.time()  # anchor to convert buf_t (monotonic) to wall-clock, used by ws_ecg
     t_last_metrics = 0.0
     lead_off_count = 0
     lead_on_count = 0
@@ -1022,6 +1049,7 @@ def acquisition_worker():
             while STATE.buf_t and (STATE.buf_t[-1] - STATE.buf_t[0]) > BUFFER_S:
                 STATE.buf_t.popleft()
                 STATE.buf_v.popleft()
+        _diag_log_sample(now)
 
         if now - t_last_metrics >= UPDATE_EVERY_S:
             t_last_metrics = now
@@ -1223,6 +1251,9 @@ async def ws_ecg(websocket: WebSocket):
         STATE.clients += 1
         STATE.last_metrics["clients"] = STATE.clients
 
+    seq = 0  # per-connection counter: resets on reconnect, so a client-side reset is itself
+             # a reconnection event; a gap > 1 within a connection flags a missed/delayed tick
+
     try:
         while True:
             await asyncio.sleep(0.1)
@@ -1231,7 +1262,9 @@ async def ws_ecg(websocket: WebSocket):
                 metrics = dict(STATE.last_metrics)
                 t_arr = np.array(STATE.buf_t, dtype=float)
                 v_arr = np.array(STATE.buf_v, dtype=float)
+                wall_start = STATE.wall_start
 
+            t_last = None
             if len(t_arr) > 0:
                 t_last = t_arr[-1]
                 mask = t_arr >= (t_last - 10.0)
@@ -1305,9 +1338,18 @@ async def ws_ecg(websocket: WebSocket):
             metrics["display_detector_k"] = MAD_K
             metrics["demo_loop"] = use_demo_loop
 
+            # Latency/jitter/packet-loss instrumentation (see pi_diagnostics/RUNBOOK.md):
+            # seq resets to 0 on reconnect; sample_acquired_at is the last raw sample in this
+            # tick's buffer, converted from the acquisition thread's monotonic clock to wall
+            # time via wall_start (captured at the same instant as that thread's t_start), so
+            # it is directly comparable to server_sent_at without a separate clock-sync step.
+            sample_acquired_at = (wall_start + float(t_last)) if (t_last is not None and wall_start) else None
             await websocket.send_json({
                 "device": SENSOR_NAME,
                 "gateway": GATEWAY_NAME,
+                "seq": seq,
+                "server_sent_at": time.time(),
+                "sample_acquired_at": sample_acquired_at,
                 "metrics": metrics,
                 "samples": {
                     "t": t2.tolist(),
@@ -1315,6 +1357,7 @@ async def ws_ecg(websocket: WebSocket):
                     "raw_v": raw_display.tolist(),
                 },
             })
+            seq += 1
     except WebSocketDisconnect:
         pass
     finally:
